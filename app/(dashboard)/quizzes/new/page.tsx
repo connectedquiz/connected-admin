@@ -1,3 +1,4 @@
+import { Suspense } from "react";
 import QuizForm from "../_components/QuizForm";
 
 export default function NewQuizPage() {
@@ -7,7 +8,9 @@ export default function NewQuizPage() {
       <p className="text-gray-500 text-sm mb-6">
         Fill in the details below. The Quiz ID is generated automatically.
       </p>
-      <QuizForm mode="create" />
+      <Suspense fallback={<p className="text-gray-500 text-sm">Loading…</p>}>
+        <QuizForm mode="create" />
+      </Suspense>
     </div>
   );
 }
