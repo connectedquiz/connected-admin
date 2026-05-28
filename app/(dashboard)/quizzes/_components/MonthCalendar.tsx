@@ -23,20 +23,18 @@ import {
 
 // Which quiz types appear on which days for a given difficulty
 // Easy + Hard: Paragraph every day, Page on 1/10/20, Chapter on the 1st
-// Master: Tome only, always on the 1st (month picker, not day picker)
-const DAILY_TYPES: Record<Difficulty, number[]> = {
-  easy:   [5],
-  hard:   [5],
-  master: [],
-};
-const PAGE_DAYS   = [1, 10, 20];   // Page (10) quiz days
-const CHAPTER_DAY = 1;             // Chapter (30) quiz day
+// Master: Tome only on the 1st (same as Chapter day)
+const PAGE_DAYS   = [1, 10, 20]; // Page (10) quiz days
+const SPECIAL_DAY = 1;           // Chapter (30) + Tome (50) quiz day
 
 function getExpectedTypesForDay(day: number, difficulty: Difficulty): number[] {
-  if (difficulty === "master") return [];
-  const types: number[] = [...DAILY_TYPES[difficulty]];
-  if (PAGE_DAYS.includes(day))   types.push(10);
-  if (day === CHAPTER_DAY)       types.push(30);
+  if (difficulty === "master") {
+    // Master only has a Tome on the 1st
+    return day === SPECIAL_DAY ? [50] : [];
+  }
+  const types: number[] = [5]; // Paragraph every day
+  if (PAGE_DAYS.includes(day)) types.push(10);
+  if (day === SPECIAL_DAY)     types.push(30);
   return types;
 }
 
@@ -47,35 +45,6 @@ interface DaySlot {
   quizId: string;
   status: SlotStatus;
   quiz: Quiz | null;
-}
-
-interface DayData {
-  day: number;
-  slots: DaySlot[];
-  // overall day color: green if all slots complete, yellow if any started/mixed, grey if all empty
-  overallStatus: SlotStatus;
-}
-
-function computeDayData(
-  day: number,
-  difficulty: Difficulty,
-  quizzesByDate: Record<string, Quiz>
-): DayData {
-  const yyyy = ""; // filled by caller — we pass the full date string
-  const types = getExpectedTypesForDay(day, difficulty);
-  const slots: DaySlot[] = types.map((type) => {
-    // We need the full date to build the quizId — caller passes datePrefix
-    return { type, quizId: "", status: "empty", quiz: null };
-  });
-  const hasComplete = slots.some((s) => s.status === "complete");
-  const hasStarted  = slots.some((s) => s.status === "started");
-  const allComplete = slots.length > 0 && slots.every((s) => s.status === "complete");
-  const overallStatus: SlotStatus = allComplete
-    ? "complete"
-    : hasComplete || hasStarted
-    ? "started"
-    : "empty";
-  return { day, slots, overallStatus };
 }
 
 const MONTH_NAMES = [
@@ -152,10 +121,10 @@ export default function MonthCalendar({
     return "#374151";
   }
 
-  function slotBg(status: SlotStatus): string {
-    if (status === "complete") return "#4CAF50";
-    if (status === "started")  return "#B8860B";
-    return "#374151";
+  function slotBg(slot: DaySlot): string {
+    if (slot.status === "complete") return slot.type === 50 ? "#7B3F9E" : "#4CAF50";
+    if (slot.status === "started")  return "#B8860B";
+    return slot.type === 50 ? "#3B1F5E" : "#374151";
   }
 
   function slotText(status: SlotStatus): string {
@@ -187,6 +156,9 @@ export default function MonthCalendar({
   }
 
   const selectedSlots = selectedDay !== null ? buildDaySlots(selectedDay) : [];
+
+  // Legend types — show Tome in legend only for master
+  const legendTypes = difficulty === "master" ? [50] : [5, 10, 30];
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
@@ -230,13 +202,6 @@ export default function MonthCalendar({
         </div>
       </div>
 
-      {/* Master notice */}
-      {difficulty === "master" && (
-        <div className="mb-4 px-3 py-2 bg-purple-900/20 border border-purple-800/40 rounded-lg text-xs text-purple-300">
-          Tome quizzes are month-based. Use the quiz list or create directly — one Tome per month.
-        </div>
-      )}
-
       {/* ── Legend ── */}
       <div className="flex gap-4 mb-3 flex-wrap">
         {[
@@ -253,7 +218,7 @@ export default function MonthCalendar({
           </div>
         ))}
         <div className="flex items-center gap-3 ml-auto flex-wrap">
-          {[5, 10, 30].map((t) => (
+          {legendTypes.map((t) => (
             <span key={t} className="text-xs text-gray-600">
               <span className="font-mono text-gray-400">{TYPE_SHORT_LABELS[t]}</span>
               {" = "}{TYPE_NAMES[t]}
@@ -318,7 +283,7 @@ export default function MonthCalendar({
                     key={slot.type}
                     className="rounded-sm flex items-center justify-center"
                     style={{
-                      backgroundColor: slotBg(slot.status),
+                      backgroundColor: slotBg(slot),
                       width: "14px",
                       height: "12px",
                     }}
@@ -358,13 +323,13 @@ export default function MonthCalendar({
                 <div className="flex items-center gap-3">
                   <div
                     className="w-8 h-8 rounded-md flex items-center justify-center text-xs font-bold shrink-0"
-                    style={{ backgroundColor: slotBg(slot.status), color: slotText(slot.status) }}
+                    style={{ backgroundColor: slotBg(slot), color: slotText(slot.status) }}
                   >
                     {TYPE_SHORT_LABELS[slot.type]}
                   </div>
                   <div>
                     <p className="text-sm font-medium text-gray-200">
-                      {TYPE_NAMES[slot.type]}
+                      {slot.type === 50 ? "Cthalepoú's Tome" : TYPE_NAMES[slot.type]}
                     </p>
                     <p className="text-xs text-gray-500 font-mono">{slot.quizId}</p>
                   </div>
