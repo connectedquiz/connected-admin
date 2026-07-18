@@ -10,8 +10,11 @@ import {
   Difficulty,
   QuizType,
   DIFFICULTY_COLORS,
+  STATUS_COLORS,
+  STATUS_LABELS,
   TYPE_NAMES,
   buildQuizId,
+  computeQuizStatus,
 } from "@/lib/quiz-types";
 
 interface Props {
@@ -54,7 +57,11 @@ function makeClues(count: number, existing: Clue[]): Clue[] {
   ];
 }
 
-// ── Draft persistence helpers ──────────────────────────────────────────────────
+// ── Local draft persistence helpers ─────────────────────────────────────────
+// This is the fast, always-available local safety net. It is NOT the primary
+// source of truth anymore — Firestore is (see persistToFirestore below) — but
+// it fires in ~milliseconds with zero network dependency, which matters a lot
+// on mobile Safari where a page can be killed and reloaded with no warning.
 
 interface DraftData {
   date: string;
@@ -145,25 +152,36 @@ export default function QuizForm({ initialData, mode }: Props) {
   const [error,         setError]         = useState("");
   const [deleteConfirm, setDeleteConfirm] = useState(false);
 
-  // Draft state
+  // Local draft banner state
   const [draft,           setDraft]           = useState<DraftData | null>(null);
-  const [draftRestored,   setDraftRestored]   = useState(false);
   const [showDraftBanner, setShowDraftBanner] = useState(false);
   const [draftSavedAt,    setDraftSavedAt]    = useState<number | null>(null);
   const [draftStatus,     setDraftStatus]     = useState<"idle" | "saved">("idle");
 
-  const autoSaveTimerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
-  const debounceTimerRef  = useRef<ReturnType<typeof setTimeout>  | null>(null);
-  const isFirstRenderRef  = useRef(true);
+  // Firestore sync state — separate from the local draft indicator so Chris
+  // can see at a glance whether progress is only local or has actually made
+  // it to the server (and therefore to another device).
+  const [syncStatus,   setSyncStatus]   = useState<"idle" | "saving" | "synced" | "error">("idle");
+  const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null);
 
-  // ── Check for saved draft on mount ────────────────────────────────────────
+  // True once a Firestore doc exists for this quiz. Starts true in edit mode
+  // (the doc obviously already exists) and flips true in create mode the
+  // moment the first autosave successfully creates it.
+  const remoteCreatedRef = useRef(mode === "edit");
+
+  const localDebounceTimerRef  = useRef<ReturnType<typeof setTimeout>  | null>(null);
+  const remoteDebounceTimerRef = useRef<ReturnType<typeof setTimeout>  | null>(null);
+  const remoteIntervalRef      = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isFirstLocalRef        = useRef(true);
+  const isFirstRemoteRef       = useRef(true);
+
+  // ── Check for a saved local draft on mount ────────────────────────────────
 
   useEffect(() => {
-    // Only offer draft restore in create mode — in edit mode we auto-apply silently
     const saved = loadDraft(key);
     if (!saved) return;
 
-    const ageMs = Date.now() - saved.savedAt;
+    const ageMs   = Date.now() - saved.savedAt;
     const ageDays = ageMs / (1000 * 60 * 60 * 24);
     if (ageDays > 7) {
       // Draft older than 7 days — discard silently
@@ -178,41 +196,162 @@ export default function QuizForm({ initialData, mode }: Props) {
         setDraft(saved);
         setShowDraftBanner(true);
       }
+    } else {
+      // Edit mode. Previously this branch discarded the local draft
+      // unconditionally, trusting Firestore as always-authoritative — that
+      // was the actual bug losing work on mobile. The server's last synced
+      // copy can be minutes behind a live editing session. Only offer
+      // restore when the local draft is genuinely newer than what the
+      // server has; otherwise the server copy is more current and the
+      // stale local one is safe to drop.
+      const remoteUpdatedAt = initialData?.updatedAt ?? 0;
+      if (saved.savedAt > remoteUpdatedAt) {
+        setDraft(saved);
+        setShowDraftBanner(true);
+      } else {
+        clearDraft(key);
+      }
     }
-    // In edit mode: don't offer restore — live Firestore data is authoritative
-  }, [key, mode, urlDate, urlType, urlDifficulty]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, mode, urlDate, urlType, urlDifficulty, initialData?.updatedAt]);
 
-  // ── Auto-save logic ───────────────────────────────────────────────────────
+  // ── Local (localStorage) autosave — fast, synchronous-feeling safety net ──
 
-  const doSave = useCallback(() => {
-    if (draftRestored) return; // don't save a draft we just discarded
+  const doLocalSave = useCallback(() => {
     const data: DraftData = { date, type, difficulty, clues, savedAt: Date.now() };
     saveDraft(key, data);
     setDraftSavedAt(data.savedAt);
     setDraftStatus("saved");
     setTimeout(() => setDraftStatus("idle"), 2000);
-  }, [date, type, difficulty, clues, key, draftRestored]);
+  }, [date, type, difficulty, clues, key]);
 
-  // Debounced save — fires 3s after last change
+  const doLocalSaveRef = useRef(doLocalSave);
+  useEffect(() => { doLocalSaveRef.current = doLocalSave; }, [doLocalSave]);
+
+  // Debounced local save — fires 1s after the last change
   useEffect(() => {
-    if (isFirstRenderRef.current) {
-      isFirstRenderRef.current = false;
-      return;
+    if (isFirstLocalRef.current) { isFirstLocalRef.current = false; return; }
+    if (localDebounceTimerRef.current) clearTimeout(localDebounceTimerRef.current);
+    localDebounceTimerRef.current = setTimeout(doLocalSave, 1000);
+    return () => {
+      if (localDebounceTimerRef.current) clearTimeout(localDebounceTimerRef.current);
+    };
+  }, [date, type, difficulty, clues, doLocalSave]);
+
+  // ── Firestore (remote) autosave ───────────────────────────────────────────
+  // This is the layer that actually fixes cross-device resume and survives a
+  // full page reload — including the ones iOS Safari triggers on its own
+  // when it discards a backgrounded tab.
+
+  const persistToFirestore = useCallback(async (navigateToList = false): Promise<boolean> => {
+    const hasContent = clues.some(
+      (c) => c.clueText.trim().length > 0 || c.acceptedAnswers.length > 0
+    );
+
+    // Don't create a Firestore doc for a completely untouched "new quiz" page
+    // (someone opening it and immediately backing out shouldn't leave junk
+    // drafts behind). Once a doc exists, always sync — even back to empty.
+    if (!remoteCreatedRef.current && !hasContent) {
+      if (navigateToList) setError("Add at least one clue before saving.");
+      return false;
     }
-    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
-    debounceTimerRef.current = setTimeout(doSave, 3000);
-    return () => {
-      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
-    };
-  }, [date, type, difficulty, clues, doSave]);
 
-  // Interval save — every 60s regardless of changes
+    setSyncStatus("saving");
+    try {
+      if (!remoteCreatedRef.current) {
+        const newQuizId = buildQuizId(date, type, difficulty);
+        const res = await fetch("/api/quizzes", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ quizId: newQuizId, date, type, difficulty, clues }),
+          keepalive: true,
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error ?? "Save failed");
+
+        remoteCreatedRef.current = true;
+        clearDraft(key);
+        setSyncStatus("synced");
+        setLastSyncedAt(Date.now());
+
+        if (navigateToList) {
+          router.push("/quizzes");
+        } else {
+          // Silently promote this session from "create" to "edit" so that a
+          // forced mobile reload — or a visit from another device — always
+          // lands on a route that fetches real, current progress instead of
+          // a blank "new quiz" form.
+          router.replace(`/quizzes/${newQuizId}/edit`);
+        }
+      } else {
+        const idToUse = mode === "edit" ? initialData!.quizId : buildQuizId(date, type, difficulty);
+        const res = await fetch(`/api/quizzes/${idToUse}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ clues }),
+          keepalive: true,
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error ?? "Save failed");
+
+        clearDraft(key);
+        setSyncStatus("synced");
+        setLastSyncedAt(Date.now());
+
+        if (navigateToList) router.push("/quizzes");
+      }
+      return true;
+    } catch (err: unknown) {
+      setSyncStatus("error");
+      if (navigateToList) {
+        setError(err instanceof Error ? err.message : "Save failed");
+      }
+      return false;
+    }
+  }, [date, type, difficulty, clues, key, mode, initialData, router]);
+
+  const persistRef = useRef(persistToFirestore);
+  useEffect(() => { persistRef.current = persistToFirestore; }, [persistToFirestore]);
+
+  // Debounced Firestore save — fires 5s after the last change
   useEffect(() => {
-    autoSaveTimerRef.current = setInterval(doSave, 60_000);
+    if (isFirstRemoteRef.current) { isFirstRemoteRef.current = false; return; }
+    if (remoteDebounceTimerRef.current) clearTimeout(remoteDebounceTimerRef.current);
+    remoteDebounceTimerRef.current = setTimeout(() => { persistRef.current(false); }, 5000);
     return () => {
-      if (autoSaveTimerRef.current) clearInterval(autoSaveTimerRef.current);
+      if (remoteDebounceTimerRef.current) clearTimeout(remoteDebounceTimerRef.current);
     };
-  }, [doSave]);
+  }, [date, type, difficulty, clues]);
+
+  // Interval Firestore save — every 3 minutes regardless of changes
+  useEffect(() => {
+    remoteIntervalRef.current = setInterval(() => { persistRef.current(false); }, 180_000);
+    return () => {
+      if (remoteIntervalRef.current) clearInterval(remoteIntervalRef.current);
+    };
+  }, []);
+
+  // Flush on backgrounding — the actual fix for iOS Safari killing the tab.
+  // `visibilitychange` fires reliably right before Safari suspends/discards a
+  // page; `pagehide` is the more reliable of the two unload-adjacent events
+  // on iOS (unlike `beforeunload`, which Safari often ignores). Registered
+  // once on mount and reading from refs, so it always calls the latest save
+  // functions without needing to re-subscribe on every keystroke.
+  useEffect(() => {
+    const flush = () => {
+      doLocalSaveRef.current();       // instant, local, essentially can't fail
+      persistRef.current(false);      // best-effort network flush (keepalive)
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", flush);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pagehide", flush);
+    };
+  }, []);
 
   // ── Draft restore / dismiss ────────────────────────────────────────────────
 
@@ -232,14 +371,14 @@ export default function QuizForm({ initialData, mode }: Props) {
     clearDraft(key);
     setShowDraftBanner(false);
     setDraft(null);
-    setDraftRestored(true); // suppress further saves until user makes a change
   }
 
   // ── Derived values ─────────────────────────────────────────────────────────
 
   const isMaster    = difficulty === "master" || type === 50;
   const diffColor   = DIFFICULTY_COLORS[difficulty];
-  const quizId      = date ? buildQuizId(date, type, difficulty) : "—";
+  const quizId      = mode === "edit" ? initialData!.quizId : (date ? buildQuizId(date, type, difficulty) : "—");
+  const liveStatus  = computeQuizStatus(type, clues);
   const clueCountColor =
     clues.length === type
       ? "text-green-400"
@@ -362,49 +501,20 @@ export default function QuizForm({ initialData, mode }: Props) {
   }
 
   // ── Save / Delete ──────────────────────────────────────────────────────────
+  // Deliberately minimal validation now — a quiz saves as a "draft" with any
+  // amount of content. Full-completeness is no longer a gate on saving at
+  // all; it's just a computed status (see computeQuizStatus) that flips the
+  // badge green once every clue/answer is actually filled in.
 
   async function handleSave() {
     setError("");
     if (!date) { setError("Please pick a date."); return; }
-    if (clues.length !== type) {
-      setError(`This quiz needs exactly ${type} clues. You have ${clues.length}.`);
-      return;
-    }
-    if (clues.some((c) => !c.clueText.trim())) {
-      setError("All clues must have text.");
-      return;
-    }
-    if (clues.some((c) => c.acceptedAnswers.length === 0)) {
-      setError("Every clue needs at least one accepted answer.");
-      return;
-    }
 
     setSaving(true);
-    try {
-      if (mode === "create") {
-        const res = await fetch("/api/quizzes", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ quizId, date, type, difficulty, clues }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error ?? "Create failed");
-        clearDraft(key); // clean up on successful save
-        router.push("/quizzes");
-      } else {
-        const res = await fetch(`/api/quizzes/${initialData!.quizId}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ clues }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error ?? "Save failed");
-        clearDraft(key);
-        router.push("/quizzes");
-      }
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Save failed");
-      setSaving(false);
+    const ok = await persistToFirestore(true);
+    setSaving(false);
+    if (!ok && !error) {
+      setError("Save failed — check your connection and try again.");
     }
   }
 
@@ -431,9 +541,9 @@ export default function QuizForm({ initialData, mode }: Props) {
       {showDraftBanner && draft && (
         <div className="mb-4 flex items-center justify-between gap-4 px-4 py-3 bg-yellow-900/30 border border-yellow-700/50 rounded-xl">
           <div>
-            <p className="text-sm font-semibold text-yellow-300">Unsaved draft found</p>
+            <p className="text-sm font-semibold text-yellow-300">Unsaved changes found</p>
             <p className="text-xs text-yellow-600 mt-0.5">
-              Saved {formatDraftAge(draft.savedAt)} —{" "}
+              Saved {formatDraftAge(draft.savedAt)} on this device —{" "}
               {draft.difficulty} {TYPE_NAMES[draft.type]} · {draft.date}
             </p>
           </div>
@@ -442,7 +552,7 @@ export default function QuizForm({ initialData, mode }: Props) {
               onClick={restoreDraft}
               className="px-3 py-1.5 bg-yellow-600 hover:bg-yellow-500 text-white text-xs font-semibold rounded-lg transition-colors"
             >
-              Restore draft
+              Restore
             </button>
             <button
               onClick={dismissDraft}
@@ -513,7 +623,7 @@ export default function QuizForm({ initialData, mode }: Props) {
           </div>
         </div>
 
-        {/* Auto-generated ID + clue count */}
+        {/* Auto-generated ID + clue count + status */}
         <div className="flex items-center gap-3 flex-wrap">
           <span className="text-xs text-gray-500">Quiz ID:</span>
           <code
@@ -524,6 +634,12 @@ export default function QuizForm({ initialData, mode }: Props) {
           </code>
           <span className={`text-xs font-medium ${clueCountColor}`}>
             {clues.length} / {type} clues
+          </span>
+          <span
+            className="px-2 py-0.5 rounded-full text-xs font-semibold"
+            style={{ backgroundColor: STATUS_COLORS[liveStatus] + "22", color: STATUS_COLORS[liveStatus] }}
+          >
+            {STATUS_LABELS[liveStatus]}
           </span>
           {isMaster && (
             <span className="text-xs text-purple-500">
@@ -656,14 +772,31 @@ export default function QuizForm({ initialData, mode }: Props) {
             Cancel
           </button>
 
-          {/* Draft saved indicator */}
+          {/* Local draft indicator */}
           {draftSavedAt && (
             <span className={`text-xs transition-all duration-500 ${
               draftStatus === "saved" ? "text-green-400" : "text-gray-600"
             }`}>
               {draftStatus === "saved"
-                ? "✓ Draft saved"
-                : `Draft: ${formatDraftAge(draftSavedAt)}`}
+                ? "✓ Saved on this device"
+                : `Local: ${formatDraftAge(draftSavedAt)}`}
+            </span>
+          )}
+
+          {/* Server sync indicator */}
+          {syncStatus !== "idle" && (
+            <span className={`text-xs ${
+              syncStatus === "error"  ? "text-red-400"
+              : syncStatus === "saving" ? "text-gray-500"
+              : "text-green-500"
+            }`}>
+              {syncStatus === "saving"
+                ? "☁ Syncing…"
+                : syncStatus === "error"
+                ? "☁ Sync failed — saved locally only"
+                : lastSyncedAt
+                ? `☁ Synced ${formatDraftAge(lastSyncedAt)}`
+                : "☁ Synced"}
             </span>
           )}
         </div>

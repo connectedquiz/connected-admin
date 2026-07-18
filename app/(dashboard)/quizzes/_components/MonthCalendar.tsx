@@ -2,10 +2,16 @@
 
 // connected-admin/app/(dashboard)/quizzes/_components/MonthCalendar.tsx
 //
-// Displays a month calendar showing quiz completion status per day.
-// Grey  = no quiz data exists for that day/type
-// Yellow = quiz exists but incomplete (clues.length < type)
-// Green  = quiz complete (clues.length === type)
+// Displays a month calendar showing quiz status per day.
+// Grey   = no quiz doc exists yet for that day/type
+// Purple = quiz exists but is a draft (any amount of progress, including none)
+// Green  = quiz complete
+//
+// A day cell aggregates across all expected slots for that day: complete only
+// if every slot is complete, draft if anything exists but isn't fully done
+// (this is the same "purple = mixed/in-between" convention used for player
+// purchase status elsewhere in the design system, just applied to authoring
+// progress instead), empty if nothing has been created at all.
 //
 // Clicking a day cell shows a mini-popup listing all quiz slots for that day.
 // Clicking a quiz slot (any color) navigates to edit or create.
@@ -16,6 +22,7 @@ import {
   Quiz,
   Difficulty,
   DIFFICULTY_COLORS,
+  STATUS_COLORS,
   TYPE_SHORT_LABELS,
   TYPE_NAMES,
   buildQuizId,
@@ -38,7 +45,7 @@ function getExpectedTypesForDay(day: number, difficulty: Difficulty): number[] {
   return types;
 }
 
-type SlotStatus = "complete" | "started" | "empty";
+type SlotStatus = "complete" | "draft" | "empty";
 
 interface DaySlot {
   type: number;
@@ -93,10 +100,10 @@ export default function MonthCalendar({
       const dateStr = `${monthPrefix}-${String(day).padStart(2, "0")}`;
       const quizId  = buildQuizId(dateStr, type as 5 | 10 | 30 | 50, difficulty);
       const quiz    = byQuizId[quizId] ?? null;
-      let status: SlotStatus = "empty";
-      if (quiz) {
-        status = (quiz.clues?.length ?? 0) >= quiz.type ? "complete" : "started";
-      }
+      // quiz.status is computed and stored server-side (see /api/quizzes) —
+      // trust it directly rather than re-deriving from clue count here, so
+      // every view in the admin panel agrees with the others.
+      const status: SlotStatus = quiz ? (quiz.status ?? "draft") : "empty";
       return { type, quizId, status, quiz };
     });
   }
@@ -106,25 +113,25 @@ export default function MonthCalendar({
     const allComplete = slots.every((s) => s.status === "complete");
     if (allComplete) return "complete";
     const anyData = slots.some((s) => s.status !== "empty");
-    return anyData ? "started" : "empty";
+    return anyData ? "draft" : "empty";
   }
 
   function statusBg(status: SlotStatus): string {
     if (status === "complete") return "rgba(76,175,80,0.18)";
-    if (status === "started")  return "rgba(255,193,7,0.14)";
+    if (status === "draft")    return "rgba(123,63,158,0.18)";
     return "rgba(255,255,255,0.03)";
   }
 
   function statusBorder(status: SlotStatus): string {
-    if (status === "complete") return "#4CAF50";
-    if (status === "started")  return "#FFC107";
+    if (status === "complete") return STATUS_COLORS.complete;
+    if (status === "draft")    return STATUS_COLORS.draft;
     return "#374151";
   }
 
   function slotBg(slot: DaySlot): string {
-    if (slot.status === "complete") return slot.type === 50 ? "#7B3F9E" : "#4CAF50";
-    if (slot.status === "started")  return "#B8860B";
-    return slot.type === 50 ? "#3B1F5E" : "#374151";
+    if (slot.status === "complete") return STATUS_COLORS.complete;
+    if (slot.status === "draft")    return STATUS_COLORS.draft;
+    return "#374151";
   }
 
   function slotText(status: SlotStatus): string {
@@ -206,7 +213,7 @@ export default function MonthCalendar({
       <div className="flex gap-4 mb-3 flex-wrap">
         {[
           { status: "complete" as SlotStatus, label: "Complete" },
-          { status: "started"  as SlotStatus, label: "In progress" },
+          { status: "draft"    as SlotStatus, label: "Draft" },
           { status: "empty"    as SlotStatus, label: "No data" },
         ].map(({ status, label }) => (
           <div key={status} className="flex items-center gap-1.5">
@@ -340,9 +347,9 @@ export default function MonthCalendar({
                       ✓ Complete ({slot.quiz?.clues?.length}/{slot.type})
                     </span>
                   )}
-                  {slot.status === "started" && (
-                    <span className="text-xs font-semibold text-yellow-400">
-                      ⚠ {slot.quiz?.clues?.length}/{slot.type} clues
+                  {slot.status === "draft" && (
+                    <span className="text-xs font-semibold" style={{ color: STATUS_COLORS.draft }}>
+                      ◆ Draft — {slot.quiz?.clues?.length ?? 0}/{slot.type} clues
                     </span>
                   )}
                   {slot.status === "empty" && (
@@ -361,20 +368,20 @@ export default function MonthCalendar({
       {/* ── Month summary ── */}
       <div className="mt-4 pt-4 border-t border-gray-800 flex gap-4 text-xs text-gray-500 flex-wrap">
         {(() => {
-          let complete = 0, started = 0, empty = 0;
+          let complete = 0, draft = 0, empty = 0;
           for (let d = 1; d <= daysInMonth; d++) {
             const slots = buildDaySlots(d);
             slots.forEach((s) => {
               if (s.status === "complete") complete++;
-              else if (s.status === "started") started++;
+              else if (s.status === "draft") draft++;
               else empty++;
             });
           }
-          const total = complete + started + empty;
+          const total = complete + draft + empty;
           return (
             <>
               <span className="text-green-400 font-medium">{complete} complete</span>
-              <span className="text-yellow-400 font-medium">{started} in progress</span>
+              <span style={{ color: STATUS_COLORS.draft }} className="font-medium">{draft} draft</span>
               <span className="text-gray-500">{empty} empty</span>
               <span className="text-gray-600 ml-auto">{total} total quiz slots this month</span>
             </>

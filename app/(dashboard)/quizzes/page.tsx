@@ -4,7 +4,14 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Quiz, Difficulty, DIFFICULTY_COLORS, TYPE_LABELS } from "@/lib/quiz-types";
+import {
+  Quiz,
+  Difficulty,
+  DIFFICULTY_COLORS,
+  STATUS_COLORS,
+  STATUS_LABELS,
+  TYPE_LABELS,
+} from "@/lib/quiz-types";
 import MonthCalendar from "./_components/MonthCalendar";
 
 type ViewMode = "calendar" | "list";
@@ -155,10 +162,9 @@ export default function QuizzesPage() {
                   </thead>
                   <tbody>
                     {filtered.map((quiz, i) => {
-                      const color      = DIFFICULTY_COLORS[quiz.difficulty];
-                      const clueCount  = quiz.clues?.length ?? 0;
-                      const complete   = clueCount >= quiz.type;
-                      const hasPartial = clueCount > 0 && !complete;
+                      const color     = DIFFICULTY_COLORS[quiz.difficulty];
+                      const clueCount = quiz.clues?.length ?? 0;
+                      const status    = quiz.status ?? "draft"; // legacy docs pre-dating the status field
                       return (
                         <tr
                           key={quiz.quizId}
@@ -184,13 +190,13 @@ export default function QuizzesPage() {
                             {clueCount} / {quiz.type}
                           </td>
                           <td className="px-5 py-3">
-                            {complete ? (
-                              <span className="text-xs font-semibold text-green-400">✓ Complete</span>
-                            ) : hasPartial ? (
-                              <span className="text-xs font-semibold text-yellow-400">⚠ In progress</span>
-                            ) : (
-                              <span className="text-xs text-gray-600">Empty</span>
-                            )}
+                            <span
+                              className="px-2 py-0.5 rounded-full text-xs font-semibold"
+                              style={{ backgroundColor: STATUS_COLORS[status] + "22", color: STATUS_COLORS[status] }}
+                            >
+                              {status === "complete" ? "✓ " : "◆ "}
+                              {STATUS_LABELS[status]}
+                            </span>
                           </td>
                           <td className="px-5 py-3 text-right">
                             <Link
@@ -210,10 +216,9 @@ export default function QuizzesPage() {
               {/* Mobile cards */}
               <div className="sm:hidden space-y-3">
                 {filtered.map((quiz) => {
-                  const color      = DIFFICULTY_COLORS[quiz.difficulty];
-                  const clueCount  = quiz.clues?.length ?? 0;
-                  const complete   = clueCount >= quiz.type;
-                  const hasPartial = clueCount > 0 && !complete;
+                  const color     = DIFFICULTY_COLORS[quiz.difficulty];
+                  const clueCount = quiz.clues?.length ?? 0;
+                  const status    = quiz.status ?? "draft";
                   return (
                     <div
                       key={quiz.quizId}
@@ -226,11 +231,11 @@ export default function QuizzesPage() {
                         >
                           {quiz.difficulty}
                         </span>
-                        <span className={[
-                          "text-xs font-medium",
-                          complete ? "text-green-400" : hasPartial ? "text-yellow-400" : "text-gray-600",
-                        ].join(" ")}>
-                          {complete ? "✓ Complete" : hasPartial ? `⚠ ${clueCount}/${quiz.type}` : "Empty"}
+                        <span
+                          className="text-xs font-semibold"
+                          style={{ color: STATUS_COLORS[status] }}
+                        >
+                          {status === "complete" ? "✓ Complete" : `◆ Draft ${clueCount}/${quiz.type}`}
                         </span>
                       </div>
                       <code className="block text-xs font-mono text-gray-400 mb-1 break-all">

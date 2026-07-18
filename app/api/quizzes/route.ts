@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getAdminDb } from "@/lib/firebase-admin";
+import { computeQuizStatus, Clue, QuizType, Difficulty } from "@/lib/quiz-types";
 
 // GET /api/quizzes — fetch all quizzes
 export async function GET() {
@@ -21,11 +22,21 @@ export async function GET() {
   }
 }
 
-// POST /api/quizzes — create a new quiz
+// POST /api/quizzes — create a new quiz.
+// Deliberately permissive: this fires the moment the author has typed
+// *anything* real, not just when every clue/answer is filled in. Status is
+// always computed server-side from the actual content, never trusted from
+// the client, so a quiz can never be mis-marked complete.
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { quizId, date, type, difficulty, clues } = body;
+    const { quizId, date, type, difficulty, clues } = body as {
+      quizId: string;
+      date: string;
+      type: QuizType;
+      difficulty: Difficulty;
+      clues: Clue[];
+    };
 
     if (!quizId || !date || !type || !difficulty || !clues) {
       return NextResponse.json(
@@ -45,10 +56,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const quiz = { quizId, date, type, difficulty, clues };
+    const status = computeQuizStatus(type, clues);
+    const updatedAt = Date.now();
+
+    const quiz = { quizId, date, type, difficulty, clues, status, updatedAt };
     await db.collection("quizzes").doc(quizId).set(quiz);
 
-    return NextResponse.json({ success: true, quizId });
+    return NextResponse.json({ success: true, quizId, status, updatedAt });
   } catch (error) {
     console.error("Failed to create quiz:", error);
     return NextResponse.json(
