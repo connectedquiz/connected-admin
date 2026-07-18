@@ -13,6 +13,7 @@ import {
   TYPE_LABELS,
 } from "@/lib/quiz-types";
 import MonthCalendar from "./_components/MonthCalendar";
+import CategoryCoverage from "./_components/CategoryCoverage";
 
 type ViewMode = "calendar" | "list";
 
@@ -83,6 +84,9 @@ export default function QuizzesPage() {
           </Link>
         </div>
       </div>
+
+      {/* ── Category coverage panel ── */}
+      {!loading && <CategoryCoverage quizzes={quizzes} />}
 
       {/* ── Calendar view ── */}
       {viewMode === "calendar" && (

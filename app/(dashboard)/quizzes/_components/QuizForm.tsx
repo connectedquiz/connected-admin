@@ -2,7 +2,7 @@
 
 // connected-admin/app/(dashboard)/quizzes/_components/QuizForm.tsx
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   Quiz,
@@ -15,6 +15,9 @@ import {
   TYPE_NAMES,
   buildQuizId,
   computeQuizStatus,
+  normalizeAnswer,
+  DEFAULT_CATEGORIES,
+  AnswerIndexEntry,
 } from "@/lib/quiz-types";
 
 interface Props {
@@ -23,7 +26,13 @@ interface Props {
 }
 
 function emptyClue(): Clue {
-  return { clueText: "", acceptedAnswers: [], requiresExactMatch: false };
+  return { clueText: "", acceptedAnswers: [], requiresExactMatch: false, category: "" };
+}
+
+// Legacy clues (saved before the category field existed) won't have it —
+// backfill so the rest of the component never has to think about undefined.
+function normalizeClue(c: Clue): Clue {
+  return { ...c, category: c.category ?? "" };
 }
 
 function todayString(): string {
@@ -141,7 +150,7 @@ export default function QuizForm({ initialData, mode }: Props) {
   });
   const [clues, setClues] = useState<Clue[]>(() => {
     const count = (mode === "create" && urlType) ? Number(urlType) : (initialData?.type ?? 5);
-    return initialData?.clues ?? makeClues(count, []);
+    return (initialData?.clues ?? makeClues(count, [])).map(normalizeClue);
   });
   const [chipInputs, setChipInputs] = useState<string[]>(() => {
     const count = (mode === "create" && urlType) ? Number(urlType) : (initialData?.type ?? 5);
@@ -164,6 +173,11 @@ export default function QuizForm({ initialData, mode }: Props) {
   const [syncStatus,   setSyncStatus]   = useState<"idle" | "saving" | "synced" | "error">("idle");
   const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null);
 
+  // Categories + reuse checker state
+  const [categories,       setCategories]       = useState<string[]>(DEFAULT_CATEGORIES);
+  const [answerIndex,      setAnswerIndex]       = useState<AnswerIndexEntry[]>([]);
+  const [focusedChipIndex, setFocusedChipIndex]  = useState<number | null>(null);
+
   // True once a Firestore doc exists for this quiz. Starts true in edit mode
   // (the doc obviously already exists) and flips true in create mode the
   // moment the first autosave successfully creates it.
@@ -174,6 +188,20 @@ export default function QuizForm({ initialData, mode }: Props) {
   const remoteIntervalRef      = useRef<ReturnType<typeof setInterval> | null>(null);
   const isFirstLocalRef        = useRef(true);
   const isFirstRemoteRef       = useRef(true);
+
+  // ── Fetch categories + answer index once on mount ─────────────────────────
+
+  useEffect(() => {
+    fetch("/api/categories")
+      .then((r) => r.json())
+      .then((data) => { if (data.categories) setCategories(data.categories); })
+      .catch(() => { /* fall back to DEFAULT_CATEGORIES already in state */ });
+
+    fetch("/api/quizzes/answer-index")
+      .then((r) => r.json())
+      .then((data) => { if (data.entries) setAnswerIndex(data.entries); })
+      .catch(() => { /* reuse checker just won't have anything to show */ });
+  }, []);
 
   // ── Check for a saved local draft on mount ────────────────────────────────
 
@@ -360,7 +388,7 @@ export default function QuizForm({ initialData, mode }: Props) {
     setDate(draft.date);
     setType(draft.type);
     setDifficulty(draft.difficulty);
-    setClues(draft.clues);
+    setClues(draft.clues.map(normalizeClue));
     setChipInputs(draft.clues.map(() => ""));
     setShowDraftBanner(false);
     setDraft(null);
@@ -468,6 +496,37 @@ export default function QuizForm({ initialData, mode }: Props) {
     });
   }
 
+  // ── Category operations ────────────────────────────────────────────────────
+
+  async function handleCategorySelect(clueIndex: number, value: string) {
+    if (value !== "__add_new__") {
+      updateClue(clueIndex, { category: value });
+      return;
+    }
+    // Simplified first-pass "add new category" flow — a quick prompt rather
+    // than a full modal. Good enough to unblock writing without over-building
+    // this before we know how often it's actually used.
+    const name = window.prompt("New category name:");
+    const trimmed = name?.trim();
+    if (!trimmed) return;
+
+    try {
+      const res = await fetch("/api/categories", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ category: trimmed }),
+      });
+      const data = await res.json();
+      if (data.categories) setCategories(data.categories);
+      updateClue(clueIndex, { category: trimmed });
+    } catch {
+      // Even if the save-to-server fails, apply it locally so typing isn't lost —
+      // it'll just need re-adding to the shared list later.
+      setCategories((prev) => [...prev, trimmed].sort((a, b) => a.localeCompare(b)));
+      updateClue(clueIndex, { category: trimmed });
+    }
+  }
+
   // ── Chip operations ────────────────────────────────────────────────────────
 
   function addChip(clueIndex: number) {
@@ -499,6 +558,18 @@ export default function QuizForm({ initialData, mode }: Props) {
       addChip(clueIndex);
     }
   }
+
+  // ── Reuse checker ──────────────────────────────────────────────────────────
+  // Only computed for whichever answer field currently has focus, so typing
+  // in a 50-clue Tome never scans the index 50 times per keystroke.
+
+  const reuseMatches = useMemo<AnswerIndexEntry[]>(() => {
+    if (focusedChipIndex === null) return [];
+    const text = chipInputs[focusedChipIndex] ?? "";
+    const norm = normalizeAnswer(text);
+    if (norm.length < 3) return [];
+    return answerIndex.filter((e) => e.normalized === norm);
+  }, [focusedChipIndex, chipInputs, answerIndex]);
 
   // ── Save / Delete ──────────────────────────────────────────────────────────
   // Deliberately minimal validation now — a quiz saves as a "draft" with any
@@ -676,6 +747,17 @@ export default function QuizForm({ initialData, mode }: Props) {
                 }
                 className="flex-1 bg-gray-800 border border-gray-700 rounded-md px-2 py-1.5 text-gray-100 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none"
               />
+              <select
+                value={clue.category || ""}
+                onChange={(e) => handleCategorySelect(i, e.target.value)}
+                className="shrink-0 bg-gray-800 border border-gray-700 rounded-md px-2 py-1.5 text-xs text-gray-300 focus:outline-none focus:ring-2 focus:ring-purple-500 w-36"
+              >
+                <option value="">— Category —</option>
+                {categories.map((cat) => (
+                  <option key={cat} value={cat}>{cat}</option>
+                ))}
+                <option value="__add_new__">+ Add new…</option>
+              </select>
               <div className="flex gap-1 shrink-0">
                 <button
                   onClick={() => moveClue(i, "up")}
@@ -708,18 +790,44 @@ export default function QuizForm({ initialData, mode }: Props) {
                   >×</button>
                 </span>
               ))}
-              <input
-                type="text"
-                value={chipInputs[i]}
-                onChange={(e) => {
-                  const next = [...chipInputs];
-                  next[i] = e.target.value;
-                  setChipInputs(next);
-                }}
-                onKeyDown={(e) => handleChipKeyDown(e, i)}
-                placeholder="Answer… (Enter to add)"
-                className="bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-gray-100 text-xs focus:outline-none focus:ring-1 focus:ring-purple-500 w-44"
-              />
+              <div className="relative">
+                <input
+                  type="text"
+                  value={chipInputs[i]}
+                  onChange={(e) => {
+                    const next = [...chipInputs];
+                    next[i] = e.target.value;
+                    setChipInputs(next);
+                  }}
+                  onFocus={() => setFocusedChipIndex(i)}
+                  onBlur={() => setTimeout(() => setFocusedChipIndex((cur) => (cur === i ? null : cur)), 150)}
+                  onKeyDown={(e) => handleChipKeyDown(e, i)}
+                  placeholder="Answer… (Enter to add)"
+                  className="bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-gray-100 text-xs focus:outline-none focus:ring-1 focus:ring-purple-500 w-44"
+                />
+
+                {/* ── Reuse checker panel — only for the focused field ── */}
+                {focusedChipIndex === i && reuseMatches.length > 0 && (
+                  <div className="absolute z-10 top-full left-0 mt-1 w-72 bg-gray-950 border border-purple-700/50 rounded-lg shadow-xl p-2">
+                    <p className="text-xs font-semibold text-purple-300 mb-1.5">
+                      Used {reuseMatches.length} time{reuseMatches.length !== 1 ? "s" : ""} before
+                    </p>
+                    <div className="space-y-1.5 max-h-40 overflow-y-auto">
+                      {reuseMatches.slice(0, 6).map((m, mi) => (
+                        <div key={mi} className="text-xs text-gray-400 border-l-2 border-gray-700 pl-2">
+                          <span className="text-gray-300">{m.clueText || "(no clue text)"}</span>
+                          <div className="text-gray-600">
+                            {m.date} · {m.category}
+                          </div>
+                        </div>
+                      ))}
+                      {reuseMatches.length > 6 && (
+                        <p className="text-xs text-gray-600">+ {reuseMatches.length - 6} more…</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
               <button
                 onClick={() => addChip(i)}
                 className="px-2 py-1 bg-purple-900/50 hover:bg-purple-800/60 text-purple-300 text-xs rounded-md"

@@ -7,6 +7,7 @@ export interface Clue {
   clueText: string;
   acceptedAnswers: string[];
   requiresExactMatch: boolean;
+  category: string; // free label from the extensible category list; "" / missing = Uncategorized
 }
 
 // "draft"    — quiz exists but is not yet fully filled in (any amount of progress, including zero)
@@ -39,6 +40,32 @@ export function computeQuizStatus(type: QuizType, clues: Clue[]): QuizStatus {
   if (clues.some((c) => !c.clueText.trim())) return "draft";
   if (clues.some((c) => c.acceptedAnswers.length === 0)) return "draft";
   return "complete";
+}
+
+// ── Answer normalization for the reuse/duplicate checker ───────────────────
+// Fuzzy-but-simple: lowercases, strips a leading article, strips punctuation,
+// collapses whitespace. Catches "Earth" / "the Earth" / "earth." as the same
+// answer without pulling in a full stemming library for a first pass.
+export function normalizeAnswer(raw: string): string {
+  return raw
+    .toLowerCase()
+    .trim()
+    .replace(/^(the|a|an)\s+/i, "")
+    .replace(/[^\w\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Shape returned by GET /api/quizzes/answer-index — one entry per accepted
+// answer across every quiz, used by QuizForm's live reuse checker.
+export interface AnswerIndexEntry {
+  normalized: string;
+  answer: string;
+  clueText: string;
+  quizId: string;
+  date: string;
+  difficulty: string;
+  category: string;
 }
 
 export const QUIZ_TYPES: QuizType[] = [5, 10, 30, 50];
@@ -87,3 +114,34 @@ export const TYPE_NAMES: Record<number, string> = {
   30: "Chapter",
   50: "Tome",
 };
+
+// Seed list for the extensible category taxonomy (stored in Firestore at
+// config/categories — this is only the fallback used the very first time
+// that doc doesn't exist yet, and covers the breadth Chris specifically
+// asked to be reminded of, plus common trivia staples).
+export const DEFAULT_CATEGORIES: string[] = [
+  "History",
+  "Geography",
+  "Language",
+  "Science",
+  "Art",
+  "Anthropology",
+  "Sports",
+  "Medicine",
+  "Mythology",
+  "Gaming",
+  "Finance",
+  "Mechanics",
+  "Fashion",
+  "Conspiracy Theories",
+  "Astrology",
+  "Music",
+  "Literature",
+  "Film & TV",
+  "Food & Drink",
+  "Technology",
+  "Nature & Animals",
+  "Politics & Current Events",
+  "Religion",
+  "Pop Culture",
+].sort((a, b) => a.localeCompare(b));
