@@ -23,6 +23,7 @@ export async function GET() {
             clueText: clue.clueText,
             quizId: quiz.quizId,
             date: quiz.date,
+            type: quiz.type,
             difficulty: quiz.difficulty,
             category: clue.category?.trim() || "Uncategorized",
           });

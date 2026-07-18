@@ -803,6 +803,7 @@ export default function QuizForm({ initialData, mode }: Props) {
                   onBlur={() => setTimeout(() => setFocusedChipIndex((cur) => (cur === i ? null : cur)), 150)}
                   onKeyDown={(e) => handleChipKeyDown(e, i)}
                   placeholder="Answer… (Enter to add)"
+                  autoComplete="off"
                   className="bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-gray-100 text-xs focus:outline-none focus:ring-1 focus:ring-purple-500 w-44"
                 />
 
@@ -817,7 +818,8 @@ export default function QuizForm({ initialData, mode }: Props) {
                         <div key={mi} className="text-xs text-gray-400 border-l-2 border-gray-700 pl-2">
                           <span className="text-gray-300">{m.clueText || "(no clue text)"}</span>
                           <div className="text-gray-600">
-                            {m.date} · {m.category}
+                            {m.date} · {m.difficulty.charAt(0).toUpperCase() + m.difficulty.slice(1)}{" "}
+                            {TYPE_NAMES[m.type]} · {m.category}
                           </div>
                         </div>
                       ))}
